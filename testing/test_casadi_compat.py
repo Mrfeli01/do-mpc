@@ -23,6 +23,9 @@
 import sys
 import unittest
 
+import numpy as np
+from casadi import DM
+
 do_mpc_path = '../'
 if not do_mpc_path in sys.path:
     sys.path.append('../')
@@ -95,6 +98,57 @@ class TestCasadiCompat(unittest.TestCase):
         results = do_mpc.data.load_results(LEGACY_PICKLE)
         self.assertIn('mpc', results)
         self.assertGreater(results['mpc']['_x'].shape[0], 0)
+
+
+class TestAuxExpressionSparsity(unittest.TestCase):
+    """Guards the casadi 3.8 structural zero change in the _aux struct.
+
+    A Model that never calls set_expression carries a single aux entry, the
+    default DM(0). casadi 3.8 propagates that structural zero through an MX
+    function call, so _aux_expression_fun returns a 1x1 with nnz 0 while the
+    struct slot it is written into is dense. struct.__setitem__ compares
+    sparsity patterns and rejects it, which broke MPC and MHE setup for every
+    such model. casadi 3.7 returned a dense result and never tripped this.
+    """
+
+    def _model(self, symvar_type):
+        model = do_mpc.model.Model('continuous', symvar_type)
+        x = model.set_variable('_x', 'x')
+        u = model.set_variable('_u', 'u')
+        model.set_rhs('x', -x + u)
+        # Deliberately no set_expression: '_aux' holds only the default DM(0).
+        model.setup()
+        self.assertEqual(list(model['_aux'].keys()), ['default'])
+        return model
+
+    def test_mpc_setup_without_expressions(self):
+        for symvar_type in ['SX', 'MX']:
+            with self.subTest(symvar_type=symvar_type):
+                mpc = do_mpc.controller.MPC(self._model(symvar_type))
+                mpc.settings.supress_ipopt_output()
+                mpc.set_param(n_horizon=2, t_step=0.1, store_full_solution=True)
+                mpc.set_objective(mterm=DM(0), lterm=DM(0))
+                mpc.set_rterm(u=1e-2)
+                mpc.setup()
+
+    def test_mhe_setup_without_expressions(self):
+        for symvar_type in ['SX', 'MX']:
+            with self.subTest(symvar_type=symvar_type):
+                model = do_mpc.model.Model('continuous', symvar_type)
+                x = model.set_variable('_x', 'x')
+                u = model.set_variable('_u', 'u')
+                model.set_rhs('x', -x + u, process_noise=True)
+                model.set_meas('y', x, meas_noise=True)
+                model.setup()
+                self.assertEqual(list(model['_aux'].keys()), ['default'])
+
+                mhe = do_mpc.estimator.MHE(model)
+                mhe.settings.supress_ipopt_output()
+                mhe.set_param(n_horizon=2, t_step=0.1, store_full_solution=True,
+                              meas_from_data=True)
+                mhe.set_default_objective(P_x=np.eye(1), P_v=np.eye(1),
+                                          P_w=np.eye(1))
+                mhe.setup()
 
 
 if __name__ == '__main__':
